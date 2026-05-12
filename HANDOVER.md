@@ -129,6 +129,43 @@ Other notes:
   (u-blox NEO-M8N, same module the sibling Pi project uses) which
   has a labelled PPS pin. Not needed.
 
+## Known gotchas
+
+**Dual CP2102 ports collide on the same `/dev/cu.usbserial-0001`.**
+Most cheap NodeMCU and ESP32 dev boards in the shack ship with
+Silicon Labs CP2102 chips, all carrying the default factory serial
+number `0001`. macOS (and Linux) hand `/dev/cu.usbserial-0001` to
+whichever board enumerated first, so a hard-coded `upload_port` in
+`platformio.ini` silently flashes the wrong board whenever both
+this NodeMCU and the `vu2cpl-as3935-bridge` ESP32 are connected.
+
+Reprogramming the CP2102 EEPROM with a unique serial number was
+investigated on 2026-05-12 using `cp210x-cfg` (DiUS/cp210x-cfg)
+from both macOS (Sequoia, Apple Silicon) and the Pi (Linux). On
+both hosts, the vendor-OUT control transfer returns success with no
+libusb error, but the chip's EEPROM is unchanged on the next
+enumeration (`iSerial` stays `0001`). The chip's markings confirm
+it's a genuine Silicon Labs CP2102 (not a CH9102X clone), so the
+write isn't being rejected at the protocol layer — the EEPROM has
+been **factory-locked** by whoever assembled the dev board, and
+that lock is permanent. No software path forward.
+
+Workaround in place: `flash.sh` and `monitor.sh` at the repo root
+enumerate the visible USB-serial devices and use bash's `select` to
+prompt for the right one when more than one is present. The same
+two scripts live in `vu2cpl-as3935-bridge`; both repos' `platformio.ini`
+intentionally leaves `upload_port` and `monitor_port` unset so the
+wrappers are the single source of truth.
+
+```sh
+./flash.sh       # build + upload, prompts when >1 port present
+./monitor.sh     # serial monitor, same prompt
+```
+
+The rule "ESP firmware projects use a `flash.sh`/`monitor.sh` picker,
+not a pinned `upload_port`" is captured in `~/.claude/CLAUDE.md` so
+future ESP repos pick it up automatically.
+
 ## Bring-up lessons (milestone 1)
 
 Captured because they cost real bench time and aren't obvious from
