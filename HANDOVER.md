@@ -2,34 +2,49 @@
 
 ## Status
 
-**Milestones 1–3 done 2026-05-12.** `src/main.cpp` is a working
-PPS-disciplined NTP server. A small `TimeSync` state machine pairs
-each PPS edge with the Unix-seconds value parsed from its
-`$GxRMC` sentence; NTP timestamps are then computed as
-`unix_seconds_at_pps + (micros() - micros_at_pps_edge)`, packed
-onto the NTP epoch (+2,208,988,800 s offset).
+**Milestones 1–4 done 2026-05-12 → 13.** `src/main.cpp` is a working
+PPS-disciplined NTP server with MQTT status broadcast. A small
+`TimeSync` state machine pairs each PPS edge with the Unix-seconds
+value parsed from its `$GxRMC` sentence; NTP timestamps are computed
+as `unix_seconds_at_pps + (micros() - micros_at_pps_edge)`, packed
+onto the NTP epoch (+2,208,988,800 s offset). A separate MQTT
+service loop publishes a retained JSON status to
+`shack/esp8266-ntp/status` every 30 s.
 
-- **Synced** (fresh fix + PPS+RMC pair within 900 ms): replies
-  advertise stratum 1, refid `GPS`, LI 0, precision −20 (~1 µs
-  local), root dispersion ~1 ms.
-- **Holdover** (no fresh PPS+RMC for >5 s, or fix lost): replies
-  drop to stratum 16, refid `INIT`, LI 3. Clients silently fall
-  back to other servers per RFC 5905 §3.5.
+- **Synced** (fresh fix + PPS+RMC pair, latency in [100 ms, 800 ms]):
+  NTP replies advertise stratum 1, refid `GPS`, LI 0, precision −20
+  (~1 µs local), root dispersion ~1 ms. MQTT status has
+  `pps_sync=true`, `ref_id="GPS"`, `stratum=1`, real `ts`.
+- **Holdover** (no fresh PPS+RMC for >5 s, or fix lost): NTP replies
+  drop to stratum 16, refid `INIT`, LI 3 — clients silently fall back
+  to other servers per RFC 5905 §3.5. MQTT status has
+  `pps_sync=false`, `ref_id="INIT"`, `stratum=16`, `ts=0`.
+- **Wi-Fi loss / power off:** broker holds LWT
+  `{"event":"offline"}` retained on the status topic.
 
-Verified to date:
+Verified end-to-end:
 - M1 — NMEA + PPS counter, 60/60 PPS per minute, ±10 µs interval
   jitter (ESP crystal vs GPS atomic).
 - M2 — Mac `sntp 192.168.1.38` round-trips 3–7 ms, server correctly
   refused as unsynchronised (deliberate placeholder stage).
-- M3 — verified live against the Mac on 2026-05-13. `sntp 192.168.1.38`
+- M3 — verified against the Mac on 2026-05-13. `sntp 192.168.1.38`
   reports `−0.0015 s ± 0.004 s` against Apple's reference NTP — well
   inside the handover's 1–10 ms LAN Wi-Fi target and matching the 1 ms
-  root-dispersion we advertise. Off-by-one timing bug found and fixed
+  root-dispersion we advertise. Off-by-one timing race found and fixed
   in the first attempt (see "Bring-up lessons (milestone 3)" below).
+- M4 — `mosquitto_sub -h 192.168.1.169 -t "shack/esp8266-ntp/#" -v`
+  on the Mac sees a retained JSON immediately on subscribe with all
+  16 fields populated correctly: `stratum=1`, `ref_id="GPS"`,
+  `pps_sync=true`, `pps_interval_us≈1000005`, `fix_mode="3D"`,
+  `sat_used=22`, `rssi_dbm=-62`, sane `uptime_s` and `free_heap`.
 
-Next: M4 — MQTT status publish under `shack/esp8266-ntp/` so the
-Node-RED dashboard can render the ESP alongside the production Pi
-NTP server. M5 is the cross-server offset measurement write-up.
+Field-deployable now: pin a DHCP reservation for `192.168.1.38`,
+plug into a window-side USB charger, point LAN NTP clients at it.
+The production Pi `gpsntp.local` remains primary; this is the
+parallel/redundant learning path.
+
+Next: M5 — long-soak cross-server offset measurement against the Pi
+NTP server, plotted, written up in the README.
 
 ## Why this project exists
 
@@ -339,8 +354,11 @@ re-derive it.
    firmware flashing? *Lean: add OTA later — keep v0.1 minimal.*
    → Still open; deferred past M5.
 6. **MQTT status broadcast?** *Lean: out of scope for v0.1, add later.*
-   → To be done in M4. Topic prefix `shack/esp8266-ntp/`, broker
-   and field conventions per "Shack conventions" above.
+   → **Decided in M4:** done. Retained JSON on
+   `shack/esp8266-ntp/status` every 30 s via PubSubClient; LWT
+   `{"event":"offline"}` retained on the same topic. Field names
+   mirror the Pi's `shack/gpsntp/chrony` schema where they apply
+   so Node-RED can render both servers from one widget.
 
 ## Performance expectations
 
@@ -406,9 +424,17 @@ Also worth a skim:
    each PPS edge with its RMC time within a 900 ms window; replies
    advertise stratum 1 / refid `GPS` when fresh, fall back to
    stratum 16 / refid `INIT` after 5 s of stale sync.
-4. **M4: MQTT status broadcast.** Publish to `shack/esp8266-ntp/`
+4. ~~**M4: MQTT status broadcast.** Publish to `shack/esp8266-ntp/`
    under the conventions in "Shack conventions". LWT for offline
-   detection. Mirror Pi field names where they overlap.
+   detection. Mirror Pi field names where they overlap.~~ **Done
+   2026-05-13.** Retained `shack/esp8266-ntp/status` published every
+   30 s via PubSubClient; LWT `{"event":"offline"}` retained on the
+   same topic. 16-field JSON with `host`, `ts`, `stratum`, `ref_id`,
+   `leap`, `root_delay_s`, `root_dispersion_s`, `fix_mode`,
+   `sat_used` mirroring Pi field names where they apply, plus ESP-
+   specific `pps_count`, `pps_interval_us`, `pps_sync`,
+   `ntp_requests`, `rssi_dbm`, `uptime_s`, `free_heap`. Verified
+   from the Mac via `mosquitto_sub`.
 5. **M5: Measurement.** Discipline another machine against this
    server, log offsets vs the Pi NTP server for several hours,
    write up findings in the repo README.

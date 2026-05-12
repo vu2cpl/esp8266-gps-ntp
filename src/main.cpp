@@ -1,10 +1,18 @@
-// Milestone 3 — PPS-disciplined NTP server.
+// Milestone 4 — PPS-disciplined NTP server + MQTT status publish.
 //
-// Combines milestones 1 and 2:
+// Builds on milestones 1-3:
 //   - NMEA via SoftwareSerial on D2, PPS via interrupt on D5 (M1).
 //   - Wi-Fi via WiFiManager + UDP/123 listener (M2).
+//   - PPS-disciplined NTP time + holdover (M3).
+//   - Retained MQTT status to shack/esp8266-ntp/status every 30 s (M4),
+//     with LWT `{"event":"offline"}` so the broker maintains a marker
+//     when the ESP drops. Topic field names mirror the Pi NTP server's
+//     `shack/gpsntp/chrony` topic where they apply (host, ts, stratum,
+//     ref_id, leap, root_delay_s, root_dispersion_s, fix_mode,
+//     sat_used) plus ESP-specific (pps_count, pps_interval_us,
+//     pps_sync, ntp_requests, rssi_dbm, uptime_s, free_heap).
 //
-// New in M3: the NTP responder uses real PPS-disciplined GPS time.
+// In M3 (still in M4): the NTP responder uses real PPS-disciplined GPS time.
 // On each PPS edge the ISR records micros() as the on-time reference.
 // When the next $GxRMC sentence arrives (within ~500 ms of that edge),
 // we know the Unix epoch for that PPS edge. NTP requests are then
@@ -30,6 +38,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
+#include <PubSubClient.h>
 
 constexpr uint8_t  GPS_RX_PIN        = D2;
 constexpr uint8_t  PPS_PIN           = D5;
@@ -61,9 +70,24 @@ constexpr const char* WIFI_AP_NAME          = "vu2cpl-esp8266-ntp-setup";
 constexpr const char* WIFI_AP_PASSWORD      = "vu2cpl1234";
 constexpr const char* WIFI_HOSTNAME         = "esp8266-ntp";
 
+constexpr const char* MQTT_BROKER             = "192.168.1.169";
+constexpr uint16_t    MQTT_PORT               = 1883;
+constexpr const char* MQTT_CLIENT_ID          = "esp8266-ntp";
+constexpr const char* MQTT_TOPIC_STATUS       = "shack/esp8266-ntp/status";
+constexpr const char* MQTT_LWT_OFFLINE        = "{\"event\":\"offline\"}";
+constexpr uint16_t    MQTT_KEEPALIVE_S        = 60;
+constexpr uint32_t    MQTT_PUBLISH_INTERVAL_MS  = 30000;
+constexpr uint32_t    MQTT_RECONNECT_BACKOFF_MS = 5000;
+constexpr uint8_t     MQTT_SOCKET_TIMEOUT_S   = 2;  // keep loop() responsive when broker is down
+
 SoftwareSerial gpsSerial(GPS_RX_PIN, -1);
 TinyGPSPlus    gps;
 WiFiUDP        ntpUdp;
+WiFiClient     mqttWifiClient;
+PubSubClient   mqttClient(mqttWifiClient);
+
+uint32_t lastMqttPublishMs        = 0;
+uint32_t lastMqttConnectAttemptMs = 0;
 
 volatile uint32_t ppsCount          = 0;
 volatile uint32_t ppsLastEdgeMicros = 0;
@@ -111,6 +135,15 @@ static bool syncIsCurrent() {
   if (!timeSync.valid) return false;
   uint32_t sincePps = micros() - timeSync.microsAtPps;
   return sincePps < SYNC_HOLDOVER_US;
+}
+
+// Current best estimate of wall-clock Unix seconds. Returns 0 when not
+// synced (used by MQTT to omit a meaningful ts — clients will see 0
+// and ignore, mirroring how chrony handles unsynchronised state).
+static uint32_t currentUnixSeconds() {
+  if (!syncIsCurrent()) return 0;
+  uint32_t delta = micros() - timeSync.microsAtPps;
+  return timeSync.unixSecondsAtPps + (delta / 1000000UL);
 }
 
 // Look for a fresh (PPS edge, RMC date+time) pair and update timeSync.
@@ -257,6 +290,131 @@ static void handleNtpRequest() {
                   synced ? "GPS" : "INIT");
 }
 
+// --- MQTT status publisher --------------------------------------------------
+
+// Attempt one connection to the shack broker. Returns true on success.
+// We connect with LWT so the broker holds an "offline" marker for us
+// whenever we drop unexpectedly; the next status publish on
+// (re)connect overwrites it.
+static bool mqttConnect() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  Serial.printf_P(PSTR("[mqtt] connecting to %s:%u as %s\n"),
+                  MQTT_BROKER, MQTT_PORT, MQTT_CLIENT_ID);
+
+  bool ok = mqttClient.connect(
+    MQTT_CLIENT_ID,
+    nullptr, nullptr,         // no auth on the shack broker
+    MQTT_TOPIC_STATUS,        // will topic = our status topic
+    0,                         // will QoS
+    true,                      // will retain
+    MQTT_LWT_OFFLINE          // will message
+  );
+
+  if (ok) {
+    Serial.println(F("[mqtt] connected"));
+  } else {
+    Serial.printf_P(PSTR("[mqtt] connect failed, state=%d\n"), mqttClient.state());
+  }
+  return ok;
+}
+
+// Build the status JSON and publish it retained. Field names mirror
+// the Pi NTP server's `shack/gpsntp/chrony` topic where they apply, so
+// Node-RED can render both servers from one schema.
+static void mqttPublishStatus() {
+  if (!mqttClient.connected()) return;
+
+  bool synced = syncIsCurrent();
+  uint32_t ts = currentUnixSeconds();  // 0 when unsynced
+
+  noInterrupts();
+  uint32_t ppsNow      = ppsCount;
+  uint32_t ppsEdge     = ppsLastEdgeMicros;
+  uint32_t ppsPrevEdge = ppsPrevEdgeMicros;
+  interrupts();
+
+  int32_t intervalUs = (int32_t)(ppsEdge - ppsPrevEdge);
+  bool haveFix = gps.location.isValid() &&
+                 gps.location.age() < SYNC_FIX_MAX_AGE_MS;
+
+  char buf[480];
+  int n = snprintf(buf, sizeof(buf),
+    "{"
+    "\"host\":\"%s\","
+    "\"ts\":%lu,"
+    "\"stratum\":%u,"
+    "\"ref_id\":\"%s\","
+    "\"leap\":%u,"
+    "\"root_delay_s\":0,"
+    "\"root_dispersion_s\":0.001,"
+    "\"fix_mode\":\"%s\","
+    "\"sat_used\":%u,"
+    "\"pps_count\":%lu,"
+    "\"pps_interval_us\":%ld,"
+    "\"pps_sync\":%s,"
+    "\"ntp_requests\":%lu,"
+    "\"rssi_dbm\":%d,"
+    "\"uptime_s\":%lu,"
+    "\"free_heap\":%u"
+    "}",
+    WIFI_HOSTNAME,
+    (unsigned long)ts,
+    synced ? 1u : 16u,
+    synced ? "GPS" : "INIT",
+    synced ? 0u : 3u,
+    haveFix ? "3D" : "none",
+    gps.satellites.value(),
+    (unsigned long)ppsNow,
+    (long)intervalUs,
+    synced ? "true" : "false",
+    (unsigned long)ntpRequestsHandled,
+    WiFi.RSSI(),
+    (unsigned long)(millis() / 1000UL),
+    ESP.getFreeHeap()
+  );
+
+  if (n < 0 || n >= (int)sizeof(buf)) {
+    Serial.println(F("[mqtt] status JSON would overflow buffer, skipping publish"));
+    return;
+  }
+
+  bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, buf, true);  // retain=true
+  if (!ok) {
+    Serial.printf_P(PSTR("[mqtt] publish failed, state=%d (msg %d bytes)\n"),
+                    mqttClient.state(), n);
+  }
+}
+
+// Called from loop(). Handles (re)connect throttling and periodic publish.
+static void mqttServiceLoop() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  uint32_t now = millis();
+
+  if (!mqttClient.connected()) {
+    if (now - lastMqttConnectAttemptMs < MQTT_RECONNECT_BACKOFF_MS) return;
+    lastMqttConnectAttemptMs = now;
+    if (mqttConnect()) {
+      // Publish immediately on (re)connect so we overwrite any retained
+      // LWT and the dashboard sees us back online without waiting for
+      // the next interval.
+      mqttPublishStatus();
+      lastMqttPublishMs = now;
+    }
+    return;
+  }
+
+  mqttClient.loop();
+
+  if (now - lastMqttPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
+    mqttPublishStatus();
+    lastMqttPublishMs = now;
+  }
+}
+
+// --- Wi-Fi onboarding -------------------------------------------------------
+
 static void connectWifi() {
   WiFi.persistent(true);
   WiFi.setAutoReconnect(true);
@@ -301,6 +459,13 @@ void setup() {
 
   ntpUdp.begin(NTP_PORT);
   Serial.printf_P(PSTR("[ntp] listening on udp/%u\n"), NTP_PORT);
+
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
+  Serial.printf_P(PSTR("[mqtt] will publish %s every %lus\n"),
+                  MQTT_TOPIC_STATUS,
+                  (unsigned long)(MQTT_PUBLISH_INTERVAL_MS / 1000UL));
 }
 
 void loop() {
@@ -311,6 +476,8 @@ void loop() {
   maybeUpdateTimeSync();
 
   handleNtpRequest();
+
+  mqttServiceLoop();
 
   static uint32_t lastLog          = 0;
   static uint32_t lastReportedPps  = 0;
