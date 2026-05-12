@@ -21,9 +21,11 @@ Verified to date:
   jitter (ESP crystal vs GPS atomic).
 - M2 — Mac `sntp 192.168.1.38` round-trips 3–7 ms, server correctly
   refused as unsynchronised (deliberate placeholder stage).
-- M3 — code path live; field verification against the production Pi
-  via `chronyc add server 192.168.1.38 iburst` is the next user-facing
-  step.
+- M3 — verified live against the Mac on 2026-05-13. `sntp 192.168.1.38`
+  reports `−0.0015 s ± 0.004 s` against Apple's reference NTP — well
+  inside the handover's 1–10 ms LAN Wi-Fi target and matching the 1 ms
+  root-dispersion we advertise. Off-by-one timing bug found and fixed
+  in the first attempt (see "Bring-up lessons (milestone 3)" below).
 
 Next: M4 — MQTT status publish under `shack/esp8266-ntp/` so the
 Node-RED dashboard can render the ESP alongside the production Pi
@@ -165,6 +167,42 @@ wrappers are the single source of truth.
 The rule "ESP firmware projects use a `flash.sh`/`monitor.sh` picker,
 not a pinned `upload_port`" is captured in `~/.claude/CLAUDE.md` so
 future ESP repos pick it up automatically.
+
+## Bring-up lessons (milestone 3)
+
+**The off-by-one second.** First field test of M3 reported a clean
+`−1.009 s ± 0.004 s` offset on every `sntp` query — the ±0.004 s
+matched Wi-Fi UDP jitter (expected), but the 1.009 s offset was a
+real bug, not noise. Root cause was a race in `maybeUpdateTimeSync()`:
+
+1. PPS edge `N` fires at second T → `ppsCount=N`,
+   `ppsLastEdgeMicros=X`.
+2. ~300 ms later, RMC for T arrives, parser updates `gps.time`. We
+   sync correctly: `(unix=T, microsAtPps=X)`.
+3. Second T+1 begins. PPS edge `N+1` fires →
+   `ppsLastEdgeMicros = X+1_000_000`.
+4. The next `maybeUpdateTimeSync()` runs *before* the RMC for T+1
+   has been parsed. `gps.time` still holds T, but `ppsCount` has
+   advanced. Our previous check (`sincePps < 900 ms`) was passed
+   because `sincePps = a few ms`. We sync wrong:
+   `(unix=T, microsAtPps=X+1_000_000)` — the *old* RMC's time
+   paired with the *new* PPS edge, off by one second.
+
+Fixed by tightening the gates so we sync only when *all four* hold:
+location fresh, **RMC just parsed** (`gps.time.age() <
+SYNC_RMC_MAX_AGE_MS`), PPS edge advanced, and PPS-to-RMC latency
+in `[SYNC_PPS_LATENCY_MIN_US, SYNC_PPS_LATENCY_MAX_US]`. The latency
+band rejects the race in step 4 (`sincePps` would be a few ms, below
+`SYNC_PPS_LATENCY_MIN_US = 100 ms`) and also rejects the symmetric
+case where RMC arrives unusually late (`sincePps > 800 ms`).
+
+Post-fix `sntp` measurements showed `−0.0015 s ± 0.004 s`, indistinguishable
+from a stratum-2 LAN client of Apple's NTP. The lesson: when the
+firmware is doing two independent things (counting PPS in an ISR,
+parsing NMEA in main-loop) that have to agree on a second boundary,
+verify the cross-stream timing constraints explicitly — don't trust
+that "PPS advanced + we have valid GPS data" implies the two
+correspond to the same second.
 
 ## Bring-up lessons (milestone 1)
 

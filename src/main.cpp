@@ -44,9 +44,17 @@ constexpr size_t   NTP_PACKET_SIZE   = 48;
 constexpr uint32_t NTP_UNIX_OFFSET   = 2208988800UL;
 
 // Sync state thresholds:
-constexpr uint32_t SYNC_PPS_WINDOW_US   = 900000UL;   // RMC must arrive < 900 ms after its PPS
-constexpr uint32_t SYNC_HOLDOVER_US     = 5000000UL;  // 5 s of holdover before falling back
-constexpr uint32_t SYNC_FIX_MAX_AGE_MS  = 3000UL;     // location data must be < 3 s old
+// We sync only when *all four* gates pass: location fresh, RMC freshly
+// parsed, PPS edge advanced, and PPS-to-RMC latency in a plausible band.
+// The latency band is the off-by-one fix: a too-small sincePps means a
+// *newer* PPS edge has fired between the RMC's emission and our parse,
+// so the latest edge belongs to the *next* second, not the one this
+// RMC describes; a too-large sincePps means the pairing is unreliable.
+constexpr uint32_t SYNC_PPS_LATENCY_MIN_US = 100000UL;  // RMC arrives ≥ 100 ms after its PPS
+constexpr uint32_t SYNC_PPS_LATENCY_MAX_US = 800000UL;  // ...and ≤ 800 ms
+constexpr uint32_t SYNC_RMC_MAX_AGE_MS     = 200UL;     // act only on freshly parsed RMC
+constexpr uint32_t SYNC_HOLDOVER_US        = 5000000UL; // 5 s of holdover before falling back
+constexpr uint32_t SYNC_FIX_MAX_AGE_MS     = 3000UL;    // location data must be < 3 s old
 
 constexpr uint32_t    WIFI_PORTAL_TIMEOUT_S = 300;
 constexpr const char* WIFI_AP_NAME          = "vu2cpl-esp8266-ntp-setup";
@@ -112,6 +120,12 @@ static void maybeUpdateTimeSync() {
   if (!gps.location.isValid() || gps.location.age() > SYNC_FIX_MAX_AGE_MS) return;
   if (!gps.date.isValid() || !gps.time.isValid()) return;
 
+  // RMC must have been parsed in the last SYNC_RMC_MAX_AGE_MS — otherwise
+  // gps.time still holds the *previous* second's value and we'd
+  // associate it with a newer PPS edge (1-second offset).
+  if (gps.time.age() > SYNC_RMC_MAX_AGE_MS) return;
+  if (gps.date.age() > SYNC_RMC_MAX_AGE_MS) return;
+
   noInterrupts();
   uint32_t edgeCount  = ppsCount;
   uint32_t edgeMicros = ppsLastEdgeMicros;
@@ -120,8 +134,13 @@ static void maybeUpdateTimeSync() {
   if (edgeCount == 0) return;
   if (edgeCount == timeSync.ppsCountAtSync) return;  // already synced this edge
 
+  // Belt-and-braces second check: the PPS edge we're pairing must be
+  // in the expected post-PPS-pre-RMC window. Too-small → next-second's
+  // PPS already fired before we parsed this RMC; too-large → RMC is
+  // unusually late and we can't safely pair.
   uint32_t sincePps = micros() - edgeMicros;
-  if (sincePps > SYNC_PPS_WINDOW_US) return;  // PPS too old to safely pair with current RMC
+  if (sincePps < SYNC_PPS_LATENCY_MIN_US) return;
+  if (sincePps > SYNC_PPS_LATENCY_MAX_US) return;
 
   uint32_t unixSec = computeUnixSeconds(
     gps.date.year(), gps.date.month(), gps.date.day(),
