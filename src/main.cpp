@@ -8,8 +8,11 @@
 //     and the latest parsed UTC / fix state.
 //
 // Wiring (NodeMCU label → ESP8266 GPIO):
-//   D2 (GPIO4)  <- L89 TX    (SoftwareSerial RX, 9600 baud)
-//   D5 (GPIO14) <- L89 PPS   (collector-side tap, inverted → FALLING)
+//   D2 (GPIO4)  <- L89 TX    (SoftwareSerial RX, 9600 baud — *not* the
+//                             NodeMCU RX header pin, which is GPIO3 /
+//                             hardware UART RX and shares the USB-serial)
+//   D5 (GPIO14) <- L89 PPS   (direct on Quectel L89 pin 6, native
+//                             active-high → RISING edge marks on-time)
 //   3V3, GND    <- L89 power and common ground
 
 #include <Arduino.h>
@@ -42,13 +45,13 @@ void setup() {
   Serial.println();
   Serial.println(F("[boot] ESP8266 GPS NTP — milestone 1 (NMEA + PPS counter)"));
   Serial.printf_P(PSTR("[boot] GPS RX on D2 (GPIO4) @ %u baud\n"), GPS_BAUD);
-  Serial.println(F("[boot] PPS on D5 (GPIO14), FALLING edge (collector-side tap)"));
+  Serial.println(F("[boot] PPS on D5 (GPIO14), RISING edge (direct on L89 pin 6)"));
   Serial.println(F("[boot] Once the L89 has a 3D fix, expect 60 PPS per 60 s window."));
 
   gpsSerial.begin(GPS_BAUD);
 
   pinMode(PPS_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PPS_PIN), onPpsEdge, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PPS_PIN), onPpsEdge, RISING);
 }
 
 void loop() {
@@ -56,14 +59,14 @@ void loop() {
     gps.encode(gpsSerial.read());
   }
 
-  static uint32_t nextSecondLog   = LOG_INTERVAL_MS;
+  static uint32_t lastLog         = 0;
   static uint32_t lastReportedPps = 0;
   static uint32_t windowStartMs   = 0;
   static uint32_t windowStartPps  = 0;
 
   uint32_t now = millis();
-  if ((int32_t)(now - nextSecondLog) < 0) return;
-  nextSecondLog += LOG_INTERVAL_MS;
+  if (now - lastLog < LOG_INTERVAL_MS) return;
+  lastLog = now;
 
   noInterrupts();
   uint32_t ppsNow      = ppsCount;

@@ -2,10 +2,16 @@
 
 ## Status
 
-**Not started.** This document is the design brief / handover written
-*before* any code is committed, so the next session (or another
-contributor) can start from a clear shared understanding instead of
-re-deriving the design.
+**Milestone 1 verified 2026-05-12.** `src/main.cpp` reads NMEA via
+SoftwareSerial on D2 and counts PPS interrupts on D5. Edge-to-edge
+intervals sit at 1,000,000 µs ± ~10 µs (the ±10 µs is the ESP8266
+80 MHz crystal drifting against the GPS's atomic PPS), and
+`[gps] window 60s: 60 PPS [PASS]` triggers reliably. `fix=Y sats=14`
+with cleanly parsed UTC followed within seconds of bring-up.
+
+Next: milestone 2 — Wi-Fi onboarding via WiFiManager and a placeholder
+NTP responder served from `millis()`, so the UDP/123 path is proved
+out before being wired to the GPS time source.
 
 ## Why this project exists
 
@@ -62,46 +68,71 @@ it accepts all of it. The goal is learning, not better timekeeping.
 
 ## PPS verification — RESOLVED 2026-05-12
 
-**Outcome: PPS is accessible, tap point identified, polarity inverted.**
+**Outcome: PPS is accessible at two viable tap points; using the
+native L89 pin 6 directly (active-high, RISING edge).**
 
-Findings:
+The story in order, because both tap points come up in the code/
+comments and the reasoning behind each matters:
 
-- The 7Semi L89 breakout carries a blue indicator LED that blinks at
-  1 Hz once the module has a 3D fix — confirmed PPS is alive on the
-  PCB.
-- Tracing the LED: it is driven by an NPN transistor with a current-
-  limit resistor returning to the +3.3 V rail. The accessible tap
-  point is on the **collector** side of that transistor, not the
-  base. Tapping at the base would be cleaner but the base trace has
-  no exposed pad.
-- This means the signal at the tap point is **inverted** vs. the
-  chip's native PPS:
-  - Native L89 PPS (per Quectel L89 Hardware Design rev 1.1):
-    active-high, idles 0 V, pulses to +3.3 V for 500 ms each second,
-    rising edge = on-time second boundary.
-  - At our tap point: idles +3.3 V, pulses to ~0 V for 500 ms,
-    **falling edge = on-time second boundary**.
-- Multimeter readings were inconclusive (50% duty cycle averages to
-  ~1.65 V regardless of polarity). The polarity is established from
-  the circuit topology, which is the reliable signal here.
-- Added switching delay through the transistor is sub-µs — negligible
-  for this project's ms-class accuracy ceiling. The transistor also
-  buffers the GPS module's drive pin from the ESP, which is a small
-  bonus.
+1. **The 1 Hz blue LED on the 7Semi L89 breakout** confirmed PPS is
+   alive on the PCB. The LED only lights when the module has a 3D
+   fix, so it doubles as a coarse "fix acquired" indicator.
+2. **First tap: LED-driver transistor collector.** Tracing the LED
+   showed it is driven by an NPN transistor with a current-limit
+   resistor returning to the +3.3 V rail. The collector node is
+   reachable. At this point the signal is **inverted** vs. the chip:
+   it idles +3.3 V and pulses to ~0 V for 500 ms each second, so the
+   *falling* edge is the on-time boundary. We verified this worked
+   (firmware on `FALLING` produced clean 1 Hz interrupts).
+3. **Second tap (the one in use): direct on Quectel L89 module
+   pin 6.** This is the chip's native 1 PPS output — active-high,
+   idles 0 V, pulses to +3.3 V for 500 ms, **rising** edge marks the
+   on-time second (per Quectel L89 Hardware Design rev 1.1, 3.9 ns
+   RMS accuracy). No intermediate transistor delay, no inversion.
+   Firmware uses `attachInterrupt(D5, isr, RISING)`.
 
-**Implication for firmware:** `attachInterrupt(D5, isr, FALLING)`,
-not `RISING`. Documented at point of use in the sketch.
+Why two tap points are documented:
 
-For background (original verification plan, kept because the
-reasoning is still useful):
+- If you ever lose access to module pin 6 (heat-damaged pad, rework
+  trouble), the collector-side tap is still a valid fallback — just
+  flip the ISR back to `FALLING` and accept ~sub-µs of buffering
+  delay through the transistor.
+- The two are functionally interchangeable for ms-class accuracy.
+  The direct tap is preferred because the timing reference is the
+  *leading* edge, not a delayed/inverted edge.
 
-- Quectel L89 silicon: 1 PPS on module pin 6, 3.9 ns RMS accuracy,
-  3.3 V CMOS, rising-edge, 500 ms pulse width.
+Other notes:
+
+- Multimeter readings were useless for distinguishing polarity here
+  (50% duty cycle averages to ~1.65 V regardless). Topology was the
+  reliable signal — confirmed at the breadboard with the working
+  firmware afterwards.
 - The 7Semi product page and Arduino library do not document PPS
   exposure — finding it required PCB inspection.
-- Fallback if it had turned out unreachable: swap to a GY-NEO8MV2
+- Fallback if neither tap had been reachable: swap to a GY-NEO8MV2
   (u-blox NEO-M8N, same module the sibling Pi project uses) which
   has a labelled PPS pin. Not needed.
+
+## Bring-up lessons (milestone 1)
+
+Captured because they cost real bench time and aren't obvious from
+the code:
+
+- **L89 TX must go to `D2` (GPIO4)**, *not* the NodeMCU header pin
+  labelled `RX`. The `RX` header pin is GPIO3 — the hardware UART RX
+  the USB-serial chip uses. Hooking the GPS there silently fights
+  for the same path the monitor reads from; you see no `[nmea]`
+  bytes in the SoftwareSerial buffer and you see NMEA fragments
+  leaking *into* your debug output as garbage.
+- **L89 PPS pulse, not the LED bias, is the timing source.** When
+  the module loses fix, the PPS line goes inactive even if the
+  module is otherwise transmitting NMEA; that's expected and the
+  firmware should fall back to stratum 16 in that state (TBD in
+  milestone 3).
+- **Spurious PPS counts on a floating D5** look like wire-touch
+  transients separated by many seconds, with `lvl=0` always. If you
+  see that pattern, the PPS jumper isn't actually seated — re-plug
+  it before touching anything else.
 
 ## Wiring sketch (assuming PPS is accessible)
 
@@ -110,7 +141,7 @@ reasoning is still useful):
 | VCC (3.3 V) | 3V3 | Power |
 | GND | GND | Common ground |
 | TX | D2 (GPIO4) via SoftwareSerial | Leaves USB serial free for debug |
-| PPS | D5 (GPIO14) — `attachInterrupt`-capable | The whole game lives here. Inverted at our tap point → use `FALLING` edge. |
+| PPS | D5 (GPIO14) — `attachInterrupt`-capable | The whole game lives here. Tap is direct on Quectel L89 pin 6 (active-high native) → use `RISING` edge. Collector-side LED-driver tap is a documented fallback (then `FALLING`). |
 
 UART jitter does not matter for accuracy. PPS edge is the timing
 reference; NMEA only labels which integer second the edge belongs to.
@@ -260,24 +291,29 @@ Also worth a skim:
   protocol).
 - Quectel `L89 Hardware Design rev 1.1` PDF — pin 6 PPS details.
 
-## Suggested next steps if reopening this project
+## Milestone roadmap
 
-1. **First, verify the L89 PPS exposure.** Do not buy, solder, or
-   build anything else until this question is settled. See
-   "Critical open question" above.
-2. If PPS *is* available:
-   a. Breadboard the wiring per the sketch.
-   b. Flash a "hello world" sketch that reads NMEA via
-      `TinyGPSPlus` and counts PPS interrupts. Verify exactly
-      60 interrupts in 60 seconds. If it drifts, the PPS line is
-      noisy and you need a pull-down or shorter wire.
-3. Get the ESP8266 onto Wi-Fi, serve a *fake* NTP response from
-   `millis()` only (no GPS). Make sure clients (Mac `sntp`,
-   another Pi running chrony) can query it.
-4. Stitch the PPS+NMEA→Unix epoch logic into the NTP response.
-5. Measure: discipline another machine against this server, log
-   offsets vs the Pi NTP server for several hours, write up
-   findings in the repo README.
+1. ~~**M1: NMEA + PPS counter.** Breadboard the wiring per the
+   sketch, flash `src/main.cpp`, verify exactly 60 PPS interrupts
+   per 60 s window with `fix=Y` and parsed UTC.~~ **Done
+   2026-05-12.**
+2. **M2: Wi-Fi + placeholder NTP responder.** Add WiFiManager so the
+   ESP joins the shack Wi-Fi without compile-time secrets. Open a
+   UDP listener on port 123, reply to NTPv4 requests with a packet
+   whose timestamps are derived from `millis()` only (no GPS yet).
+   Verify with `sntp /dev/null -d <esp-ip>` from the Mac and
+   `chronyc sourcestats` from another Pi. Clients should see a
+   plausible response (wrong time, but well-formed).
+3. **M3: GPS-disciplined NTP responder.** Stitch the PPS+NMEA→Unix
+   epoch logic into the NTP response. Stratum 1 when fixed, stratum
+   16 when not. Holdover behaviour: respond stratum 16 immediately
+   on fix loss.
+4. **M4: MQTT status broadcast.** Publish to `shack/esp8266-ntp/`
+   under the conventions in "Shack conventions". LWT for offline
+   detection. Mirror Pi field names where they overlap.
+5. **M5: Measurement.** Discipline another machine against this
+   server, log offsets vs the Pi NTP server for several hours,
+   write up findings in the repo README.
 
 ## Relationship to `pi-gps-ntp-server`
 
