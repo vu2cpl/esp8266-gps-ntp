@@ -60,38 +60,48 @@ it accepts all of it. The goal is learning, not better timekeeping.
 | 7Semi L89 GPS breakout | Quectel L89 IRNSS-capable multi-GNSS, 3.3 V native |
 | 3.3 V-only signal levels | Both ends are 3.3 V CMOS — no level shifting needed |
 
-## Critical open question — verify BEFORE building anything
+## PPS verification — RESOLVED 2026-05-12
 
-**Does the 7Semi L89 breakout expose the 1 PPS pin on a header pad?**
+**Outcome: PPS is accessible, tap point identified, polarity inverted.**
 
-We chased this in the Pi project's L89HA evaluation and got a
-strong-but-not-conclusive *no*:
+Findings:
 
-- The Quectel L89 silicon definitely has 1 PPS on module pin 6
-  (3.9 ns RMS accuracy, 3.3 V CMOS, rising-edge, 500 ms pulse width;
-  see official Quectel L89 Hardware Design rev 1.1).
-- The 7Semi product page lists exposed pins as TX, RX, BAT, I2C — no
-  PPS.
-- The 7Semi Arduino library's wiring table likewise only mentions
-  TX/RX/VCC/GND.
+- The 7Semi L89 breakout carries a blue indicator LED that blinks at
+  1 Hz once the module has a 3D fix — confirmed PPS is alive on the
+  PCB.
+- Tracing the LED: it is driven by an NPN transistor with a current-
+  limit resistor returning to the +3.3 V rail. The accessible tap
+  point is on the **collector** side of that transistor, not the
+  base. Tapping at the base would be cleaner but the base trace has
+  no exposed pad.
+- This means the signal at the tap point is **inverted** vs. the
+  chip's native PPS:
+  - Native L89 PPS (per Quectel L89 Hardware Design rev 1.1):
+    active-high, idles 0 V, pulses to +3.3 V for 500 ms each second,
+    rising edge = on-time second boundary.
+  - At our tap point: idles +3.3 V, pulses to ~0 V for 500 ms,
+    **falling edge = on-time second boundary**.
+- Multimeter readings were inconclusive (50% duty cycle averages to
+  ~1.65 V regardless of polarity). The polarity is established from
+  the circuit topology, which is the reliable signal here.
+- Added switching delay through the transistor is sub-µs — negligible
+  for this project's ms-class accuracy ceiling. The transistor also
+  buffers the GPS module's drive pin from the ESP, which is a small
+  bonus.
 
-If PPS is **not** broken out, this project stalls — you'd be left
-with NMEA-only timing (~100 ms class), which isn't worth doing on a
-microcontroller. Verification steps before any soldering:
+**Implication for firmware:** `attachInterrupt(D5, isr, FALLING)`,
+not `RISING`. Documented at point of use in the sketch.
 
-1. Inspect the breakout top *and* bottom for a labelled `PPS` /
-   `1PPS` pad. Also any unlabelled hole or via near the module.
-2. Look for a small LED (often blue) that flashes at 1 Hz once the
-   module has a 3D fix — usually wired to the PPS line.
-3. With the module powered, probe module pin 6 with a multimeter
-   (DC volts, expect brief 3 V pulses) or scope (clean 1 Hz square wave).
-4. Email 7Semi support: *"Is the L89 module's pin 6 (1PPS) routed to
-   any pad on this breakout?"*
+For background (original verification plan, kept because the
+reasoning is still useful):
 
-**If yes →** proceed with the wiring sketch below.
-**If no →** swap to a GY-NEO8MV2 (u-blox NEO-M8N — the same module
-the sibling Pi project ended up using) which has labelled PPS, and
-shelve the L89 for a separate navigation experiment.
+- Quectel L89 silicon: 1 PPS on module pin 6, 3.9 ns RMS accuracy,
+  3.3 V CMOS, rising-edge, 500 ms pulse width.
+- The 7Semi product page and Arduino library do not document PPS
+  exposure — finding it required PCB inspection.
+- Fallback if it had turned out unreachable: swap to a GY-NEO8MV2
+  (u-blox NEO-M8N, same module the sibling Pi project uses) which
+  has a labelled PPS pin. Not needed.
 
 ## Wiring sketch (assuming PPS is accessible)
 
@@ -100,7 +110,7 @@ shelve the L89 for a separate navigation experiment.
 | VCC (3.3 V) | 3V3 | Power |
 | GND | GND | Common ground |
 | TX | D2 (GPIO4) via SoftwareSerial | Leaves USB serial free for debug |
-| PPS | D5 (GPIO14) — `attachInterrupt`-capable | The whole game lives here |
+| PPS | D5 (GPIO14) — `attachInterrupt`-capable | The whole game lives here. Inverted at our tap point → use `FALLING` edge. |
 
 UART jitter does not matter for accuracy. PPS edge is the timing
 reference; NMEA only labels which integer second the edge belongs to.
@@ -135,6 +145,52 @@ Libraries:
   Arduino core)
 - **No NTP library.** Hand-roll the 48-byte packet from RFC 5905
   Figure 8 — simpler than learning someone else's wrapper.
+
+## Shack conventions (from sibling repos)
+
+Reference projects in `~/projects/`:
+
+- `Pi GPS NTP Server/` — production NTP. Publishes chrony metrics
+  via cron every 60 s to retained topic `shack/gpsntp/chrony`.
+  Hostname `gpsntp.local`, IP `192.168.1.158`, Ethernet-wired.
+- `vu2cpl-as3935-bridge/` — VU2CPL lightning detector. ESP32 +
+  PlatformIO, single monolithic `src/main.cpp`, WiFiManager captive
+  portal, PubSubClient v2.8 against the shack broker. Closest
+  stylistic precedent for *this* firmware.
+
+Conventions to inherit when milestone 2 (Wi-Fi + MQTT) lands:
+
+- **Wi-Fi credentials.** WiFiManager captive portal, *not* a
+  compile-time `secrets.h`. Setup AP `vu2cpl-esp8266-ntp-setup`,
+  portal password `vu2cpl1234` (mirrors AS3935 bridge). Factory
+  reset via long-press of the FLASH/BOOT button at boot.
+- **MQTT broker.** `192.168.1.169:1883`, no auth.
+- **MQTT library.** `knolleary/PubSubClient@^2.8`.
+- **MQTT topics.** `shack/esp8266-ntp/` prefix, parallel to Pi's
+  `shack/gpsntp/`. Initial layout:
+  - `shack/esp8266-ntp/status` — retained, periodic state JSON.
+  - `shack/esp8266-ntp/hb` — retained heartbeat.
+  - `shack/esp8266-ntp/cmd` and `.../cmd/ack` — control plane.
+  - LWT: `shack/esp8266-ntp/status` with `{"event":"offline"}`
+    retained, so Node-RED notices the server going away.
+- **Status fields.** Mirror Pi field names where they exist (one
+  Node-RED dashboard can render both servers): `host`, `ts`,
+  `stratum`, `fix_mode`, `sat_used`, `sat_seen`. Plus ESP-specific:
+  `pps_count`, `pps_interval_us`, `rssi_dbm`, `uptime_s`,
+  `free_heap`.
+- **OTA.** Deferred. AS3935 also skips OTA; USB upload via
+  `pio run -t upload` is fine during iteration.
+- **File layout.** Monolithic `src/main.cpp`, no `lib/`. AS3935
+  precedent: *"a library wrapper would only obscure the contract."*
+- **Logging.** `Serial.begin(115200)`; format `[subsystem] message`,
+  e.g. `[boot]`, `[gps]`, `[wifi]`, `[mqtt]`, `[ntp]`.
+- **README / HANDOVER pattern.** README: Hardware table → Software
+  stack → Status → Documentation links. HANDOVER.md captures
+  decisions, rationale, operational checks.
+
+Nothing here is binding — if a precedent doesn't fit, document the
+deviation in this section so the next reader doesn't have to
+re-derive it.
 
 ## Decisions yet to be made
 
