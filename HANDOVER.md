@@ -2,16 +2,32 @@
 
 ## Status
 
-**Milestone 1 verified 2026-05-12.** `src/main.cpp` reads NMEA via
-SoftwareSerial on D2 and counts PPS interrupts on D5. Edge-to-edge
-intervals sit at 1,000,000 µs ± ~10 µs (the ±10 µs is the ESP8266
-80 MHz crystal drifting against the GPS's atomic PPS), and
-`[gps] window 60s: 60 PPS [PASS]` triggers reliably. `fix=Y sats=14`
-with cleanly parsed UTC followed within seconds of bring-up.
+**Milestones 1–3 done 2026-05-12.** `src/main.cpp` is a working
+PPS-disciplined NTP server. A small `TimeSync` state machine pairs
+each PPS edge with the Unix-seconds value parsed from its
+`$GxRMC` sentence; NTP timestamps are then computed as
+`unix_seconds_at_pps + (micros() - micros_at_pps_edge)`, packed
+onto the NTP epoch (+2,208,988,800 s offset).
 
-Next: milestone 2 — Wi-Fi onboarding via WiFiManager and a placeholder
-NTP responder served from `millis()`, so the UDP/123 path is proved
-out before being wired to the GPS time source.
+- **Synced** (fresh fix + PPS+RMC pair within 900 ms): replies
+  advertise stratum 1, refid `GPS`, LI 0, precision −20 (~1 µs
+  local), root dispersion ~1 ms.
+- **Holdover** (no fresh PPS+RMC for >5 s, or fix lost): replies
+  drop to stratum 16, refid `INIT`, LI 3. Clients silently fall
+  back to other servers per RFC 5905 §3.5.
+
+Verified to date:
+- M1 — NMEA + PPS counter, 60/60 PPS per minute, ±10 µs interval
+  jitter (ESP crystal vs GPS atomic).
+- M2 — Mac `sntp 192.168.1.38` round-trips 3–7 ms, server correctly
+  refused as unsynchronised (deliberate placeholder stage).
+- M3 — code path live; field verification against the production Pi
+  via `chronyc add server 192.168.1.38 iburst` is the next user-facing
+  step.
+
+Next: M4 — MQTT status publish under `shack/esp8266-ntp/` so the
+Node-RED dashboard can render the ESP alongside the production Pi
+NTP server. M5 is the cross-server offset measurement write-up.
 
 ## Why this project exists
 
@@ -226,25 +242,30 @@ re-derive it.
 ## Decisions yet to be made
 
 1. **UART path.** SoftwareSerial on D1/D2 (USB debug stays free) vs.
-   hardware UART0 with TX/RX swap (cleaner timing, no USB debug).
-   *Lean: SoftwareSerial — UART jitter doesn't matter; debug matters.*
-2. **Stratum claim.** Honest: stratum 2 (Wi-Fi adds jitter to a true
-   stratum-1 source). Conventional: stratum 1 (the source is GPS).
-   *Lean: stratum 1, since this never goes to public pool — LAN
-   clients can decide if they trust it.*
-3. **Holdover behaviour on fix loss.** Options: stop responding;
-   keep drifting on last-known frequency; respond as stratum 16.
-   *Lean: respond as stratum 16 — clients silently fall over to
-   other servers, exactly the right behaviour.*
-4. **Time-keeping unit.** `millis()` (1 ms tick, easy) vs `micros()`
-   (1 µs tick, wraps every 71 minutes, more book-keeping).
-   *Lean: `micros()`, handle wrap with `int32_t` subtraction.*
+   hardware UART0 with TX/RX swap. *Lean: SoftwareSerial.*
+   → **Decided in M1:** SoftwareSerial on D2 (GPIO4). The hardware
+   UART stays for `Serial.print` debug. Confirmed working.
+2. **Stratum claim.** Honest: stratum 2 (Wi-Fi adds jitter). Conv-
+   entional: stratum 1 (source is GPS). *Lean: stratum 1.*
+   → **Decided in M3:** stratum 1 when synced, stratum 16 when not.
+   LAN-only, never public — clients decide trust. Wi-Fi jitter is
+   accounted for in the dispersion field, not stratum.
+3. **Holdover behaviour on fix loss.** Stop / drift / report
+   stratum 16. *Lean: stratum 16.*
+   → **Decided in M3:** stratum 16 after 5 s without a fresh
+   PPS+RMC pair (`SYNC_HOLDOVER_US = 5_000_000`). RFC 5905 §3.5
+   conforming; clients silently fall back to other servers.
+4. **Time-keeping unit.** `millis()` vs `micros()`.
+   → **Decided in M3:** `micros()` for PPS edge capture and NTP
+   timestamp interpolation (32-bit wraps every 71 min, handled via
+   uint32_t subtraction). `millis()` only for the per-second log
+   pacing where 1 ms granularity is fine.
 5. **OTA updates.** Add `ArduinoOTA` from the start, or keep wired
    firmware flashing? *Lean: add OTA later — keep v0.1 minimal.*
-6. **MQTT status broadcast?** The Pi project publishes chrony
-   metrics to the shack MQTT broker so a Node-RED widget and a
-   SwiftBar plugin can show live status. The ESP8266 could do the
-   same. *Lean: out of scope for v0.1. Add later if useful.*
+   → Still open; deferred past M5.
+6. **MQTT status broadcast?** *Lean: out of scope for v0.1, add later.*
+   → To be done in M4. Topic prefix `shack/esp8266-ntp/`, broker
+   and field conventions per "Shack conventions" above.
 
 ## Performance expectations
 
@@ -297,17 +318,19 @@ Also worth a skim:
    sketch, flash `src/main.cpp`, verify exactly 60 PPS interrupts
    per 60 s window with `fix=Y` and parsed UTC.~~ **Done
    2026-05-12.**
-2. **M2: Wi-Fi + placeholder NTP responder.** Add WiFiManager so the
+2. ~~**M2: Wi-Fi + placeholder NTP responder.** Add WiFiManager so the
    ESP joins the shack Wi-Fi without compile-time secrets. Open a
-   UDP listener on port 123, reply to NTPv4 requests with a packet
-   whose timestamps are derived from `millis()` only (no GPS yet).
-   Verify with `sntp /dev/null -d <esp-ip>` from the Mac and
-   `chronyc sourcestats` from another Pi. Clients should see a
-   plausible response (wrong time, but well-formed).
-3. **M3: GPS-disciplined NTP responder.** Stitch the PPS+NMEA→Unix
+   UDP listener on port 123, reply to NTPv4 requests with timestamps
+   derived from `millis()` only (no GPS yet).~~ **Done 2026-05-12.**
+   Mac `sntp 192.168.1.38` round-tripped in 3–7 ms and correctly
+   refused the server as unsynchronised (stratum 16 / refid `INIT`).
+3. ~~**M3: GPS-disciplined NTP responder.** Stitch the PPS+NMEA→Unix
    epoch logic into the NTP response. Stratum 1 when fixed, stratum
    16 when not. Holdover behaviour: respond stratum 16 immediately
-   on fix loss.
+   on fix loss.~~ **Done 2026-05-12.** `TimeSync` state machine pairs
+   each PPS edge with its RMC time within a 900 ms window; replies
+   advertise stratum 1 / refid `GPS` when fresh, fall back to
+   stratum 16 / refid `INIT` after 5 s of stale sync.
 4. **M4: MQTT status broadcast.** Publish to `shack/esp8266-ntp/`
    under the conventions in "Shack conventions". LWT for offline
    detection. Mirror Pi field names where they overlap.
