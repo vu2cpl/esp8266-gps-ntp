@@ -179,6 +179,22 @@ wrappers are the single source of truth.
 ./monitor.sh     # serial monitor, same prompt
 ```
 
+First-run / fork bring-up uses `install.py` at the repo root:
+
+```sh
+python3 install.py
+```
+
+It auto-detects macOS vs Raspberry Pi (Pi is recognised via
+`/proc/cpuinfo`) and branches the PlatformIO install accordingly
+(`brew` hint on Mac; `pip --user`, with a PEP-668
+`--break-system-packages` fallback on Bookworm+ on Pi). Prompts for
+the same shack-specific knobs that live in `src/main.cpp` —
+`WIFI_AP_NAME`, `WIFI_AP_PASSWORD`, `WIFI_HOSTNAME`, `MQTT_BROKER`,
+`MQTT_CLIENT_ID`, `MQTT_TOPIC_STATUS` — with current values as
+defaults, patches the source in place, then runs `pio run` to
+verify the build. Does NOT flash; that's `./flash.sh`'s job.
+
 The rule "ESP firmware projects use a `flash.sh`/`monitor.sh` picker,
 not a pinned `upload_port`" is captured in `~/.claude/CLAUDE.md` so
 future ESP repos pick it up automatically.
