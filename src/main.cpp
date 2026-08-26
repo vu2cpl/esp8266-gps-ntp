@@ -75,6 +75,13 @@ constexpr uint16_t    MQTT_PORT               = 1883;
 constexpr const char* MQTT_CLIENT_ID          = "esp8266-ntp";
 constexpr const char* MQTT_TOPIC_STATUS       = "shack/esp8266-ntp/status";
 constexpr const char* MQTT_LWT_OFFLINE        = "{\"event\":\"offline\"}";
+// MQTT_USER / MQTT_PASS: populated by install.py at build time. Empty
+// strings mean anonymous connect (kept as a fallback for forks whose
+// broker allows anonymous; the shack broker requires auth since
+// 2026-08-21). The `svc` role account is the intended one here —
+// parallels the Pi's `shack/gpsntp/*` publisher.
+constexpr const char* MQTT_USER               = "";
+constexpr const char* MQTT_PASS               = "";
 constexpr uint16_t    MQTT_KEEPALIVE_S        = 60;
 constexpr uint32_t    MQTT_PUBLISH_INTERVAL_MS  = 30000;
 constexpr uint32_t    MQTT_RECONNECT_BACKOFF_MS = 5000;
@@ -299,12 +306,20 @@ static void handleNtpRequest() {
 static bool mqttConnect() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  Serial.printf_P(PSTR("[mqtt] connecting to %s:%u as %s\n"),
-                  MQTT_BROKER, MQTT_PORT, MQTT_CLIENT_ID);
+  // PubSubClient reads user/pass as nullptr → anonymous connect. Empty
+  // strings would be sent verbatim as blank credentials, which the
+  // shack broker (allow_anonymous false) rejects with CONNACK 5. So
+  // collapse "" to nullptr to keep the anonymous fallback usable.
+  const char* mqttUser = (MQTT_USER[0] != '\0') ? MQTT_USER : nullptr;
+  const char* mqttPass = (MQTT_PASS[0] != '\0') ? MQTT_PASS : nullptr;
+
+  Serial.printf_P(PSTR("[mqtt] connecting to %s:%u as %s (auth: %s)\n"),
+                  MQTT_BROKER, MQTT_PORT, MQTT_CLIENT_ID,
+                  mqttUser ? mqttUser : "anonymous");
 
   bool ok = mqttClient.connect(
     MQTT_CLIENT_ID,
-    nullptr, nullptr,         // no auth on the shack broker
+    mqttUser, mqttPass,
     MQTT_TOPIC_STATUS,        // will topic = our status topic
     0,                         // will QoS
     true,                      // will retain

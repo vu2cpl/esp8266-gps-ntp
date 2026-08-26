@@ -38,13 +38,35 @@ Verified end-to-end:
   `pps_sync=true`, `pps_interval_us≈1000005`, `fix_mode="3D"`,
   `sat_used=22`, `rssi_dbm=-62`, sane `uptime_s` and `free_heap`.
 
-Field-deployable now: pin a DHCP reservation for `192.168.1.38`,
-plug into a window-side USB charger, point LAN NTP clients at it.
-The production Pi `gpsntp.local` remains primary; this is the
-parallel/redundant learning path.
+Field-deployable now: plug into a window-side USB charger, DHCP-
+reserve whatever IP it lands on, point LAN NTP clients at it. The
+production Pi `gpsntp.local` remains primary; this is the parallel/
+redundant learning path.
+
+**Post-M4 (2026-08-26): MQTT auth support.** Shack broker moved to
+auth-required on 2026-08-21 (see `~/.claude/CLAUDE.md` "Shack
+infrastructure pointers"). Firmware now takes `MQTT_USER` /
+`MQTT_PASS` constants (empty = anonymous fallback for forks; the
+shack build uses the `svc` role account, parallel to the Pi's
+`shack/gpsntp/*` publisher). `install.py` gained two prompts under
+"MQTT status publish" for these; password is *echoed* to the
+terminal and *patched into the source tree*, so the script warns
+about reverting the diff before commit if the repo is public. Do
+not commit the password. NTP serving is unaffected — it never
+touched the broker.
+
+**Unit history.** The bench unit built out for M1–M4 was given to
+a friend 2026-08-26; it is currently in `INIT`/stratum-16 holdover
+at their site despite the L89 LED blinking (fix + PPS alive), which
+strongly suggests the D2/GPIO4 SoftwareSerial jumper came loose in
+transit — the parser sees no `$GxRMC` so the sync gates never
+close. Next shack unit needs a fresh NodeMCU + L89 (or GY-NEO8MV2
+fallback); everything else — firmware, `install.py`, `flash.sh` —
+is reusable as-is.
 
 Next: M5 — long-soak cross-server offset measurement against the Pi
-NTP server, plotted, written up in the README.
+NTP server, plotted, written up in the README. Requires the next
+unit to be built and running first.
 
 ## Why this project exists
 
@@ -317,7 +339,12 @@ Conventions to inherit when milestone 2 (Wi-Fi + MQTT) lands:
   compile-time `secrets.h`. Setup AP `vu2cpl-esp8266-ntp-setup`,
   portal password `vu2cpl1234` (mirrors AS3935 bridge). Factory
   reset via long-press of the FLASH/BOOT button at boot.
-- **MQTT broker.** `192.168.1.169:1883`, no auth.
+- **MQTT broker.** `192.168.1.169:1883`. **Auth required since
+  2026-08-21** — anonymous is disabled. This firmware uses the
+  `svc` role account (parallel to Pi's `shack/gpsntp/*` publisher);
+  credentials come in via `install.py` prompts and are patched into
+  `MQTT_USER` / `MQTT_PASS` at build time. See the "Post-M4" note
+  under Status for the mechanics.
 - **MQTT library.** `knolleary/PubSubClient@^2.8`.
 - **MQTT topics.** `shack/esp8266-ntp/` prefix, parallel to Pi's
   `shack/gpsntp/`. Initial layout:

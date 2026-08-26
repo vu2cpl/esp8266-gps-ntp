@@ -183,8 +183,12 @@ def main():
     hostname = ask("ESP hostname",       grep_constexpr("WIFI_HOSTNAME",    "esp8266-ntp"))
 
     hdr("MQTT status publish")
-    broker = ask("Broker IP/host",   grep_constexpr("MQTT_BROKER",       "192.168.1.169"))
-    topic  = ask("Status topic",     grep_constexpr("MQTT_TOPIC_STATUS", "shack/esp8266-ntp/status"))
+    broker   = ask("Broker IP/host",   grep_constexpr("MQTT_BROKER",       "192.168.1.169"))
+    topic    = ask("Status topic",     grep_constexpr("MQTT_TOPIC_STATUS", "shack/esp8266-ntp/status"))
+    print(f"  {D}Shack broker requires auth since 2026-08-21. Blank = anonymous"
+          f" (only works on a broker that allows it).{N}")
+    mqtt_user = ask("MQTT username",   grep_constexpr("MQTT_USER", "") or "svc")
+    mqtt_pass = ask("MQTT password",   grep_constexpr("MQTT_PASS", ""))
 
     # 4. Apply patches
     hdr("Patching src/main.cpp")
@@ -194,6 +198,13 @@ def main():
     patch_constexpr("MQTT_BROKER", broker)
     patch_constexpr("MQTT_CLIENT_ID", hostname)   # match hostname for clarity
     patch_constexpr("MQTT_TOPIC_STATUS", topic)
+    patch_constexpr("MQTT_USER", mqtt_user)
+    patch_constexpr("MQTT_PASS", mqtt_pass)
+    if mqtt_pass:
+        warn("MQTT_PASS is now embedded in src/main.cpp. If this repo is"
+             " pushed to a public remote, revert with `git checkout --"
+             " src/main.cpp` before commit or keep the password out of"
+             " git another way.")
 
     # 5. Build verification
     hdr("Verifying build")
